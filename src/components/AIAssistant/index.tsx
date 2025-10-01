@@ -1,27 +1,37 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Button, Dialog, Input, Message, Loading } from '@alifd/next';
+import { Button, Dialog, Input, Message, Loading, Radio, Divider } from '@alifd/next';
 import { IPublicModelPluginContext } from '@alilc/lowcode-types';
 import { material } from '@alilc/lowcode-engine';
-import { generateSchema, getAvailableMaterials, mockGenerateSchema } from '../../services/aiService';
+import { generateSchema, generateSchemaWithMaterials, getAvailableMaterials, getDetailedMaterials, mockGenerateSchema } from '../../services/aiService';
 import { schema as demoSchema } from './demo';
 import './index.less';
 
 interface ChatMessage {
   id: string;
-  type: 'user' | 'assistant';
+  type: 'user' | 'assistant' | 'iteration';
   content: string;
   timestamp: number;
+  iterationData?: {
+    iterationNumber: number;
+    completed: boolean;
+    hasSchema: boolean;
+    schemaSize: number;
+    reasoning?: string;
+  };
 }
 
 interface AIAssistantProps {
   ctx: IPublicModelPluginContext;
 }
 
+type AIMode = 'standard' | 'smart-materials';
+
 const AIAssistant: React.FC<AIAssistantProps> = ({ ctx }) => {
   const [visible, setVisible] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputValue, setInputValue] = useState('');
   const [loading, setLoading] = useState(false);
+  const [aiMode, setAiMode] = useState<AIMode>('standard');
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = () => {
@@ -50,25 +60,55 @@ const AIAssistant: React.FC<AIAssistantProps> = ({ ctx }) => {
       // 调用后端AI服务生成schema
       console.log('=== AI Assistant Backend Request ===');
       console.log('用户输入:', inputValue.trim());
+      console.log('AI模式:', aiMode);
       
       // 获取当前项目的schema作为上下文
       const currentSchema = ctx.project.exportSchema('Save' as any);
       console.log('当前项目schema:', currentSchema);
       
-      // 获取可用的物料列表
-      const materials = await getAvailableMaterials();
-      console.log('可用物料:', materials);
+      let result;
       
-      // 调用AI生成schema
-      const result = await generateSchema({
-        prompt: inputValue.trim(),
-        currentSchema,
-        materials,
-      });
+      if (aiMode === 'smart-materials') {
+        // 使用智能物料选择接口
+        console.log('使用智能物料选择模式');
+        
+        // 获取详细的物料信息
+        const detailedMaterials = await getDetailedMaterials();
+        console.log('详细物料信息:', detailedMaterials);
+        
+        // 调用智能物料选择AI生成schema
+        result = await generateSchemaWithMaterials({
+          prompt: inputValue.trim(),
+          currentSchema,
+          materials: detailedMaterials.map(m => m.name), // 传递物料名称列表
+        });
+      } else {
+        // 使用标准接口
+        console.log('使用标准模式');
+        
+        // 获取可用的物料列表
+        const materials = await getAvailableMaterials();
+        console.log('可用物料:', materials);
+        
+        // 调用标准AI生成schema
+        result = await generateSchema({
+          prompt: inputValue.trim(),
+          currentSchema,
+          materials,
+        });
+      }
       
       console.log('AI生成结果:', result);
       
-      if (result.success && result.schema) {
+      // 处理智能物料选择接口的返回格式
+      let schema = null;
+      if (aiMode === 'smart-materials' && result.success && result.result && result.result.schema) {
+        schema = result.result.schema;
+      } else if (result.success && result.schema) {
+        schema = result.schema;
+      }
+      
+      if (schema) {
         // 先检查是否有打开的文档，如果没有则创建一个
         let currentDocument = ctx.project.getCurrentDocument();
         if (!currentDocument) {
@@ -81,7 +121,7 @@ const AIAssistant: React.FC<AIAssistantProps> = ({ ctx }) => {
         
         // 构建正确的项目schema结构
         const projectSchema = {
-          componentsTree: [result.schema],
+          componentsTree: [schema],
           componentsMap: material.componentsMap as any,
           version: '1.0.0',
           i18n: {},
@@ -97,14 +137,33 @@ const AIAssistant: React.FC<AIAssistantProps> = ({ ctx }) => {
         
         console.log('Schema导入成功');
         
-        const assistantMessage: ChatMessage = {
-          id: (Date.now() + 1).toString(),
-          type: 'assistant',
-          content: `✅ ${result.message || '已成功生成页面，请查看设计器中的变化。'}`,
-          timestamp: Date.now(),
-        };
+        // 显示迭代过程信息
+        const newMessages: ChatMessage[] = [];
         
-        setMessages(prev => [...prev, assistantMessage]);
+        // 如果有迭代历史，显示每次迭代的详情
+        if (result.result?.iterationHistory && result.result.iterationHistory.length > 0) {
+          result.result.iterationHistory.forEach((iteration, index) => {
+            const iterationMessage: ChatMessage = {
+              id: `iteration_${Date.now()}_${index}`,
+              type: 'iteration',
+              content: `第 ${iteration.iterationNumber} 次迭代${iteration.completed ? ' (已完成)' : ' (进行中)'}`,
+              timestamp: Date.now() + index,
+              iterationData: iteration
+            };
+            newMessages.push(iterationMessage);
+          });
+        }
+        
+        // 添加最终成功消息
+        const assistantMessage: ChatMessage = {
+          id: (Date.now() + 1000).toString(),
+          type: 'assistant',
+          content: `✅ ${result.message || '已成功生成页面，请查看设计器中的变化。'}${aiMode === 'smart-materials' ? ' (智能物料选择模式)' : ' (标准模式)'}\n\n📊 总迭代次数: ${result.result?.iterations || 0}`,
+          timestamp: Date.now() + 1000,
+        };
+        newMessages.push(assistantMessage);
+        
+        setMessages(prev => [...prev, ...newMessages]);
         Message.success('页面生成成功！');
         
       } else {
@@ -201,15 +260,44 @@ const AIAssistant: React.FC<AIAssistantProps> = ({ ctx }) => {
       >
         <div className="ai-chat-container">
           <div className="ai-chat-header">
-            <span>描述您想要的页面，AI将为您生成对应的界面</span>
-            <Button 
-              text 
-              size="medium" 
-              onClick={handleClearChat}
-              disabled={messages.length === 0}
-            >
-              清空对话
-            </Button>
+            <div className="ai-chat-header-content">
+              <span>描述您想要的页面，AI将为您生成对应的界面</span>
+              <Button 
+                text 
+                size="medium" 
+                onClick={handleClearChat}
+                disabled={messages.length === 0}
+              >
+                清空对话
+              </Button>
+            </div>
+            
+            <Divider style={{ margin: '8px 0' }} />
+            
+            <div className="ai-mode-selector">
+               <span style={{ marginRight: 12, fontSize: 13, color: '#666' }}>AI模式：</span>
+               <Radio.Group 
+                 value={aiMode} 
+                 onChange={(value) => setAiMode(value as AIMode)}
+                 disabled={loading}
+                 size="medium"
+               >
+                 <Radio value="standard">标准模式</Radio>
+                 <Radio value="smart-materials">智能物料选择</Radio>
+               </Radio.Group>
+             </div>
+            
+            <div className="ai-mode-description">
+              {aiMode === 'standard' ? (
+                <span style={{ fontSize: 12, color: '#999' }}>
+                  使用预设物料库生成页面
+                </span>
+              ) : (
+                <span style={{ fontSize: 12, color: '#999' }}>
+                  AI智能分析并选择最适合的物料组合
+                </span>
+              )}
+            </div>
           </div>
           
           <div className="ai-chat-messages">
@@ -231,7 +319,20 @@ const AIAssistant: React.FC<AIAssistantProps> = ({ ctx }) => {
                 className={`ai-chat-message ${message.type}`}
               >
                 <div className="ai-chat-message-content">
-                  <div className="ai-chat-message-text">{message.content}</div>
+                  <div className="ai-chat-message-text">
+                    {message.content}
+                    {message.type === 'iteration' && message.iterationData && (
+                      <div style={{ marginTop: 8, fontSize: 12, color: '#666' }}>
+                        <div>📊 Schema大小: {message.iterationData.schemaSize} 字符</div>
+                        <div>✅ 状态: {message.iterationData.hasSchema ? '已生成Schema' : '未生成Schema'}</div>
+                        {message.iterationData.reasoning && (
+                          <div style={{ marginTop: 4, fontStyle: 'italic' }}>
+                            💭 推理: {message.iterationData.reasoning}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
                   <div className="ai-chat-message-time">
                     {formatTime(message.timestamp)}
                   </div>

@@ -26,14 +26,14 @@ export default (api: IApi) => {
     {
       async: false,
       defer: true,
-      src: `https://g.alicdn.com/code/lib/react/18.1.0/umd/react.${
+      src: `https://g.alicdn.com/code/lib/react/16.14.0/umd/react.${
         isDev ? 'development' : 'production'
       }.js`,
     },
     {
       async: false,
       defer: true,
-      src: `https://g.alicdn.com/code/lib/react-dom/18.1.0/umd/react-dom.${
+      src: `https://g.alicdn.com/code/lib/react-dom/16.14.0/umd/react-dom.${
         isDev ? 'development' : 'production'
       }.js`,
     },

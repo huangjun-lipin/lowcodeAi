@@ -10,6 +10,19 @@ export interface GenerateSchemaResponse {
   success: boolean;
   message: string;
   schema?: any;
+  result?: {
+    schema?: any;
+    selectedMaterials?: any[];
+    iterations?: number;
+    completed?: boolean;
+    iterationHistory?: Array<{
+      iterationNumber: number;
+      completed: boolean;
+      hasSchema: boolean;
+      schemaSize: number;
+      reasoning?: string;
+    }>;
+  };
   error?: string;
 }
 
@@ -83,6 +96,63 @@ export async function getAvailableMaterials(): Promise<string[]> {
       'NextCol',
       'NextBox'
     ];
+  }
+}
+
+/**
+ * 调用新的智能物料选择接口生成schema
+ * @param data 请求数据
+ * @returns Promise<GenerateSchemaResponse>
+ */
+export async function generateSchemaWithMaterials(data: GenerateSchemaRequest): Promise<GenerateSchemaResponse> {
+  try {
+    const response = await fetch('http://localhost:3001/api/ai/generate-schema-with-materials', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(data),
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.message || `HTTP error! status: ${response.status}`);
+    }
+
+    const result = await response.json();
+    return result;
+  } catch (error) {
+    console.error('智能物料选择生成schema失败:', error);
+    return {
+      success: false,
+      message: '生成失败，请稍后重试',
+      error: error instanceof Error ? error.message : '未知错误',
+    };
+  }
+}
+
+/**
+ * 获取详细的物料信息
+ * @returns Promise<any[]>
+ */
+export async function getDetailedMaterials(): Promise<any[]> {
+  try {
+    const response = await fetch('http://localhost:3001/api/ai/materials-detailed', {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const data = await response.json();
+    return data.materials || [];
+  } catch (error) {
+    console.error('获取详细物料信息失败:', error);
+    return [];
   }
 }
 
