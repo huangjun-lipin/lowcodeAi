@@ -2,13 +2,13 @@ import React, { useState, useRef, useEffect } from 'react';
 import { Button, Dialog, Input, Message, Loading, Radio, Divider } from '@alifd/next';
 import { IPublicModelPluginContext } from '@alilc/lowcode-types';
 import { material } from '@alilc/lowcode-engine';
-import { generateSchema, generateSchemaWithMaterials, getAvailableMaterials, getDetailedMaterials, mockGenerateSchema } from '../../services/aiService';
+import { generateSchema, generateSchemaWithMaterials, generateSchemaStream, generateSchemaWithMaterialsStream, getAvailableMaterials, getDetailedMaterials, mockGenerateSchema, StreamEvent } from '../../services/aiService';
 import { schema as demoSchema } from './demo';
 import './index.less';
 
 interface ChatMessage {
   id: string;
-  type: 'user' | 'assistant' | 'iteration';
+  type: 'user' | 'assistant' | 'iteration' | 'streaming';
   content: string;
   timestamp: number;
   iterationData?: {
@@ -18,6 +18,10 @@ interface ChatMessage {
     schemaSize: number;
     reasoning?: string;
   };
+  isStreaming?: boolean;
+  streamingComplete?: boolean;
+  finalSchema?: any;
+  finalResult?: any;
 }
 
 interface AIAssistantProps {
@@ -32,7 +36,10 @@ const AIAssistant: React.FC<AIAssistantProps> = ({ ctx }) => {
   const [inputValue, setInputValue] = useState('');
   const [loading, setLoading] = useState(false);
   const [aiMode, setAiMode] = useState<AIMode>('standard');
+  const [conversationEnded, setConversationEnded] = useState(false);
+  const [pendingSchemas, setPendingSchemas] = useState<any[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const lastUpdateTimeRef = useRef<number>(0); // 使用ref来存储上次更新时间
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -41,6 +48,93 @@ const AIAssistant: React.FC<AIAssistantProps> = ({ ctx }) => {
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
+
+  const updateStreamingMessage = (messageId: string, content: string, complete: boolean = false, schema?: any, result?: any) => {
+    setMessages(prev => prev.map(msg => 
+      msg.id === messageId 
+        ? { 
+            ...msg, 
+            content, 
+            streamingComplete: complete,
+            finalSchema: schema || msg.finalSchema,
+            finalResult: result || msg.finalResult
+          }
+        : msg
+    ));
+  };
+
+  const addIterationMessage = (messageId: string, iterationData: any) => {
+    const iterationMessage: ChatMessage = {
+      id: `${messageId}_iteration_${iterationData.iterationNumber}`,
+      type: 'iteration',
+      content: `第 ${iterationData.iterationNumber} 次迭代${iterationData.completed ? ' (已完成)' : ' (进行中)'}`,
+      timestamp: Date.now(),
+      iterationData,
+    };
+    
+    setMessages(prev => [...prev, iterationMessage]);
+  };
+
+  // 应用所有待处理的schema到编辑器
+  const applyPendingSchemasToEditor = () => {
+    if (pendingSchemas.length === 0) return;
+
+    try {
+      // 使用最后一个schema（最新的结果）
+      const latestSchema = pendingSchemas[pendingSchemas.length - 1];
+      
+      // 先检查是否有打开的文档，如果没有则创建一个
+      let currentDocument = ctx.project.getCurrentDocument();
+      if (!currentDocument) {
+        console.log('没有打开的文档，创建新文档...');
+        currentDocument = ctx.project.openDocument({
+          componentName: 'Page',
+          fileName: 'ai-generated-page',
+        });
+      }
+      
+      // 构建正确的项目schema结构
+      const projectSchema = {
+        componentsTree: [latestSchema],
+        componentsMap: material.componentsMap as any,
+        version: '1.0.0',
+        i18n: {},
+      };
+      
+      console.log('准备导入的项目schema:', projectSchema);
+      
+      // 导入schema到项目
+      ctx.project.importSchema(projectSchema as any);
+      
+      // 触发重新渲染
+      ctx.project.simulatorHost?.rerender();
+      
+      console.log('Schema导入成功');
+      Message.success('页面已应用到编辑器！');
+      
+      // 清空待处理的schemas
+      setPendingSchemas([]);
+    } catch (error) {
+      console.error('应用schema到编辑器失败:', error);
+      Message.error('应用到编辑器失败');
+    }
+  };
+
+  // 结束对话并应用结果
+  const endConversationAndApply = () => {
+    setConversationEnded(true);
+    applyPendingSchemasToEditor();
+    
+    // 添加结束对话的消息
+    const endMessage: ChatMessage = {
+      id: `end_${Date.now()}`,
+      type: 'assistant',
+      content: '🎉 对话已结束，生成的页面已应用到编辑器中！',
+      timestamp: Date.now(),
+    };
+    
+    setMessages(prev => [...prev, endMessage]);
+  };
 
   const handleSendMessage = async () => {
     if (!inputValue.trim() || loading) return;
@@ -55,10 +149,23 @@ const AIAssistant: React.FC<AIAssistantProps> = ({ ctx }) => {
     setMessages(prev => [...prev, userMessage]);
     setInputValue('');
     setLoading(true);
+    setConversationEnded(false);
+
+    // 创建流式响应消息
+    const streamingMessageId = `streaming_${Date.now()}`;
+    const streamingMessage: ChatMessage = {
+      id: streamingMessageId,
+      type: 'streaming',
+      content: '正在生成...',
+      timestamp: Date.now(),
+      isStreaming: true,
+      streamingComplete: false,
+    };
+
+    setMessages(prev => [...prev, streamingMessage]);
 
     try {
-      // 调用后端AI服务生成schema
-      console.log('=== AI Assistant Backend Request ===');
+      console.log('=== AI Assistant Streaming Request ===');
       console.log('用户输入:', inputValue.trim());
       console.log('AI模式:', aiMode);
       
@@ -66,157 +173,155 @@ const AIAssistant: React.FC<AIAssistantProps> = ({ ctx }) => {
       const currentSchema = ctx.project.exportSchema('Save' as any);
       console.log('当前项目schema:', currentSchema);
       
-      let result;
+      let streamingContent = '';
+      
+      const handleStreamEvent = (event: StreamEvent) => {
+        console.log('收到流式事件:', event);
+        
+        switch (event.type) {
+          case 'start':
+            streamingContent = event.message || '开始生成...';
+            updateStreamingMessage(streamingMessageId, streamingContent);
+            break;
+            
+          case 'progress':
+            // 检查是否是迭代过程中的流式文本
+            if (event.iterationNumber && event.message) {
+              // 迭代过程中的流式文本 - 使用节流处理避免过度更新
+              if (event.streaming) {
+                // 流式文本累积显示，但限制更新频率
+                const currentTime = Date.now();
+                if (currentTime - lastUpdateTimeRef.current > 100) { // 100ms节流
+                  streamingContent += event.message;
+                  updateStreamingMessage(streamingMessageId, streamingContent);
+                  lastUpdateTimeRef.current = currentTime;
+                }
+              } else {
+                // 非流式消息直接替换
+                streamingContent = event.message;
+                updateStreamingMessage(streamingMessageId, streamingContent);
+              }
+            } else {
+              // 普通进度消息 - 直接使用完整的消息内容
+              streamingContent = event.message || '';
+              updateStreamingMessage(streamingMessageId, streamingContent);
+            }
+            break;
+            
+          case 'iteration':
+            if (event.iterationNumber) {
+              // 如果是流式迭代消息，添加迭代标识和实际内容
+              if (event.streaming && event.message) {
+                // 在当前流式消息中添加迭代标识和AI返回的内容
+                // 避免重复累积，使用节流处理
+                const newContent = `\n\n🔄 第 ${event.iterationNumber} 次迭代优化:\n${event.message}`;
+                if (!streamingContent.includes(`第 ${event.iterationNumber} 次迭代优化`)) {
+                  streamingContent += newContent;
+                  updateStreamingMessage(streamingMessageId, streamingContent);
+                }
+              } else {
+                // 非流式迭代消息，创建独立的迭代消息
+                addIterationMessage(streamingMessageId, {
+                  iterationNumber: event.iterationNumber,
+                  completed: event.completed || false,
+                  hasSchema: event.hasSchema || false,
+                  schemaSize: event.schemaSize || 0,
+                  reasoning: event.reasoning,
+                });
+              }
+            }
+            break;
+            
+          case 'complete':
+            streamingContent += '\n✅ 生成完成';
+            
+            // 正确提取schema
+            const finalSchema = event.schema || event.result?.schema;
+            updateStreamingMessage(streamingMessageId, streamingContent, true, finalSchema, event.result);
+            
+            // 保存最终结果，等待对话结束后应用
+            if (finalSchema) {
+              setPendingSchemas(prev => [...prev, finalSchema]);
+            }
+            break;
+            
+          case 'error':
+            streamingContent += '\n❌ 生成失败: ' + (event.message || event.error);
+            updateStreamingMessage(streamingMessageId, streamingContent, true);
+            break;
+        }
+      };
       
       if (aiMode === 'smart-materials') {
-        // 使用智能物料选择接口
-        console.log('使用智能物料选择模式');
+        console.log('使用智能物料选择流式模式');
         
-        // 获取详细的物料信息
         const detailedMaterials = await getDetailedMaterials();
         console.log('详细物料信息:', detailedMaterials);
         
-        // 调用智能物料选择AI生成schema
-        result = await generateSchemaWithMaterials({
+        await generateSchemaWithMaterialsStream({
           prompt: inputValue.trim(),
           currentSchema,
-          materials: detailedMaterials.map(m => m.name), // 传递物料名称列表
-        });
+          materials: detailedMaterials.map(m => m.name),
+        }, handleStreamEvent);
       } else {
-        // 使用标准接口
-        console.log('使用标准模式');
+        console.log('使用标准流式模式');
         
-        // 获取可用的物料列表
         const materials = await getAvailableMaterials();
         console.log('可用物料:', materials);
         
-        // 调用标准AI生成schema
-        result = await generateSchema({
+        await generateSchemaStream({
           prompt: inputValue.trim(),
           currentSchema,
           materials,
-        });
+        }, handleStreamEvent);
       }
       
-      console.log('AI生成结果:', result);
+    } catch (error) {
+      console.error('流式AI生成失败:', error);
       
-      // 处理智能物料选择接口的返回格式
-      let schema = null;
-      if (aiMode === 'smart-materials' && result.success && result.result && result.result.schema) {
-        schema = result.result.schema;
-      } else if (result.success && result.schema) {
-        schema = result.schema;
-      }
+      // 更新流式消息显示错误
+      updateStreamingMessage(streamingMessageId, '❌ 生成失败: ' + (error as Error).message, true);
       
-      if (schema) {
-        // 先检查是否有打开的文档，如果没有则创建一个
-        let currentDocument = ctx.project.getCurrentDocument();
-        if (!currentDocument) {
-          console.log('没有打开的文档，创建新文档...');
-          currentDocument = ctx.project.openDocument({
-            componentName: 'Page',
-            fileName: 'ai-generated-page',
+      // 降级到非流式模式
+      try {
+        console.log('降级到非流式模式');
+        let result;
+        
+        if (aiMode === 'smart-materials') {
+          const detailedMaterials = await getDetailedMaterials();
+          result = await generateSchemaWithMaterials({
+            prompt: inputValue.trim(),
+            currentSchema: ctx.project.exportSchema('Save' as any),
+            materials: detailedMaterials.map(m => m.name),
+          });
+        } else {
+          const materials = await getAvailableMaterials();
+          result = await generateSchema({
+            prompt: inputValue.trim(),
+            currentSchema: ctx.project.exportSchema('Save' as any),
+            materials,
           });
         }
         
-        // 构建正确的项目schema结构
-        const projectSchema = {
-          componentsTree: [schema],
-          componentsMap: material.componentsMap as any,
-          version: '1.0.0',
-          i18n: {},
-        };
-        
-        console.log('准备导入的项目schema:', projectSchema);
-        
-        // 导入schema到项目
-        ctx.project.importSchema(projectSchema as any);
-        
-        // 触发重新渲染
-        ctx.project.simulatorHost?.rerender();
-        
-        console.log('Schema导入成功');
-        
-        // 显示迭代过程信息
-        const newMessages: ChatMessage[] = [];
-        
-        // 如果有迭代历史，显示每次迭代的详情
-        if (result.result?.iterationHistory && result.result.iterationHistory.length > 0) {
-          result.result.iterationHistory.forEach((iteration, index) => {
-            const iterationMessage: ChatMessage = {
-              id: `iteration_${Date.now()}_${index}`,
-              type: 'iteration',
-              content: `第 ${iteration.iterationNumber} 次迭代${iteration.completed ? ' (已完成)' : ' (进行中)'}`,
-              timestamp: Date.now() + index,
-              iterationData: iteration
-            };
-            newMessages.push(iterationMessage);
-          });
-        }
-        
-        // 添加最终成功消息
-        const assistantMessage: ChatMessage = {
-          id: (Date.now() + 1000).toString(),
-          type: 'assistant',
-          content: `✅ ${result.message || '已成功生成页面，请查看设计器中的变化。'}${aiMode === 'smart-materials' ? ' (智能物料选择模式)' : ' (标准模式)'}\n\n📊 总迭代次数: ${result.result?.iterations || 0}`,
-          timestamp: Date.now() + 1000,
-        };
-        newMessages.push(assistantMessage);
-        
-        setMessages(prev => [...prev, ...newMessages]);
-        Message.success('页面生成成功！');
-        
-      } else {
-        // API调用失败，使用fallback机制
-        console.warn('AI API调用失败，使用fallback机制:', result.error);
-        
-        const fallbackResult = await mockGenerateSchema(inputValue.trim());
-        
-        if (fallbackResult.success && fallbackResult.schema) {
-          // 使用mock数据的导入逻辑
-          let currentDocument = ctx.project.getCurrentDocument();
-          if (!currentDocument) {
-            currentDocument = ctx.project.openDocument({
-              componentName: 'Page',
-              fileName: 'fallback-page',
-            });
+        if (result.success) {
+          let schema = null;
+          if (aiMode === 'smart-materials' && result.result?.schema) {
+            schema = result.result.schema;
+          } else if (result.schema) {
+            schema = result.schema;
           }
           
-          const projectSchema = {
-            componentsTree: [fallbackResult.schema],
-            componentsMap: material.componentsMap as any,
-            version: '1.0.0',
-            i18n: {},
-          };
-          
-          ctx.project.importSchema(projectSchema as any);
-          ctx.project.simulatorHost?.rerender();
-          
-          const assistantMessage: ChatMessage = {
-            id: (Date.now() + 1).toString(),
-            type: 'assistant',
-            content: `⚠️ 后端服务暂时不可用，已使用本地模拟数据生成页面。${fallbackResult.message}`,
-            timestamp: Date.now(),
-          };
-          
-          setMessages(prev => [...prev, assistantMessage]);
-          Message.warning('使用本地模拟数据生成页面');
+          if (schema) {
+            setPendingSchemas(prev => [...prev, schema]);
+            updateStreamingMessage(streamingMessageId, '✅ 使用非流式模式生成完成', true, schema, result.result);
+          }
         } else {
-          throw new Error(result.error || fallbackResult.error || '生成失败');
+          throw new Error(result.error || '生成失败');
         }
+      } catch (fallbackError) {
+        console.error('降级模式也失败:', fallbackError);
+        updateStreamingMessage(streamingMessageId, '❌ 所有生成方式都失败了', true);
       }
-    } catch (error) {
-      console.error('AI助手处理失败:', error);
-      
-      const errorMessage: ChatMessage = {
-        id: (Date.now() + 1).toString(),
-        type: 'assistant',
-        content: `❌ 处理失败: ${error instanceof Error ? error.message : '未知错误'}`,
-        timestamp: Date.now(),
-      };
-      
-      setMessages(prev => [...prev, errorMessage]);
-      Message.error('处理失败，请稍后重试');
     } finally {
       setLoading(false);
     }
@@ -231,7 +336,11 @@ const AIAssistant: React.FC<AIAssistantProps> = ({ ctx }) => {
 
   const handleClearChat = () => {
     setMessages([]);
+    setPendingSchemas([]);
+    setConversationEnded(false);
   };
+
+
 
   const formatTime = (timestamp: number) => {
     return new Date(timestamp).toLocaleTimeString('zh-CN', {
@@ -298,6 +407,23 @@ const AIAssistant: React.FC<AIAssistantProps> = ({ ctx }) => {
                 </span>
               )}
             </div>
+
+            {/* 对话结束和应用按钮 */}
+            {pendingSchemas.length > 0 && !conversationEnded && (
+              <div style={{ marginTop: 8 }}>
+                <Button 
+                  type="primary" 
+                  size="small"
+                  onClick={endConversationAndApply}
+                  disabled={loading}
+                >
+                  结束对话并应用到编辑器
+                </Button>
+                <span style={{ marginLeft: 8, fontSize: 12, color: '#666' }}>
+                  ({pendingSchemas.length} 个待应用的结果)
+                </span>
+              </div>
+            )}
           </div>
           
           <div className="ai-chat-messages">
@@ -310,6 +436,9 @@ const AIAssistant: React.FC<AIAssistantProps> = ({ ctx }) => {
                   <li>"生成一个商品列表页面，包含搜索和筛选功能"</li>
                   <li>"制作一个数据统计仪表板"</li>
                 </ul>
+                <p style={{ fontSize: 12, color: '#999', marginTop: 16 }}>
+                  💡 提示：AI会以流式方式展示生成过程，只有在您点击"结束对话并应用到编辑器"后，结果才会应用到页面编辑器中。
+                </p>
               </div>
             )}
             
@@ -321,6 +450,18 @@ const AIAssistant: React.FC<AIAssistantProps> = ({ ctx }) => {
                 <div className="ai-chat-message-content">
                   <div className="ai-chat-message-text">
                     {message.content}
+                    {message.type === 'streaming' && message.isStreaming && !message.streamingComplete && (
+                      <span className="streaming-indicator">...</span>
+                    )}
+                    {/* 显示最终的schema内容 */}
+                    {message.type === 'streaming' && message.streamingComplete && message.finalSchema && (
+                      <div style={{ marginTop: 12, padding: 8, backgroundColor: '#f5f5f5', borderRadius: 4 }}>
+                        <div style={{ fontSize: 12, color: '#666', marginBottom: 4 }}>📋 生成的Schema:</div>
+                        <pre style={{ fontSize: 11, color: '#333', whiteSpace: 'pre-wrap', maxHeight: 200, overflow: 'auto' }}>
+                          {JSON.stringify(message.finalSchema, null, 2)}
+                        </pre>
+                      </div>
+                    )}
                     {message.type === 'iteration' && message.iterationData && (
                       <div style={{ marginTop: 8, fontSize: 12, color: '#666' }}>
                         <div>📊 Schema大小: {message.iterationData.schemaSize} 字符</div>
@@ -350,10 +491,10 @@ const AIAssistant: React.FC<AIAssistantProps> = ({ ctx }) => {
                 </div>
               </div>
             )}
-            
+
             <div ref={messagesEndRef} />
           </div>
-          
+
           <div className="ai-chat-input">
             <Input.TextArea
               value={inputValue}

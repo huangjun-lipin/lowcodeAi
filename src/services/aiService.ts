@@ -26,6 +26,188 @@ export interface GenerateSchemaResponse {
   error?: string;
 }
 
+export interface StreamEvent {
+  type: 'start' | 'progress' | 'iteration' | 'complete' | 'error' | 'end';
+  message?: string;
+  timestamp?: number;
+  success?: boolean;
+  schema?: any;
+  result?: any;
+  error?: string;
+  iterationNumber?: number;
+  completed?: boolean;
+  hasSchema?: boolean;
+  schemaSize?: number;
+  reasoning?: string;
+  selectedMaterials?: any[];
+  streaming?: boolean; // 标识是否为流式文本累积显示
+}
+
+/**
+ * 流式调用AI生成schema的API (Server-Sent Events)
+ * @param data 请求数据
+ * @param onProgress 进度回调函数
+ * @returns Promise<GenerateSchemaResponse>
+ */
+export async function generateSchemaStream(
+  data: GenerateSchemaRequest, 
+  onProgress: (event: StreamEvent) => void
+): Promise<GenerateSchemaResponse> {
+  return new Promise((resolve, reject) => {
+    const eventSource = new EventSource('http://localhost:3001/api/ai/generate-schema-stream', {
+      // 注意：EventSource不支持POST请求，我们需要使用fetch的stream方式
+    });
+
+    // 使用fetch实现流式请求
+    fetch('http://localhost:3001/api/ai/generate-schema-stream', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'text/event-stream',
+      },
+      body: JSON.stringify(data),
+    })
+    .then(response => {
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader || !response.body) {
+        throw new Error('Response body is not readable');
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      function readStream(): Promise<void> {
+        return reader.read().then(({ done, value }) => {
+          if (done) {
+            return;
+          }
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const eventData = JSON.parse(line.slice(6));
+                onProgress(eventData);
+
+                if (eventData.type === 'complete') {
+                  resolve({
+                    success: eventData.success,
+                    message: eventData.message,
+                    schema: eventData.schema,
+                  });
+                  return;
+                } else if (eventData.type === 'error') {
+                  reject(new Error(eventData.message || eventData.error));
+                  return;
+                } else if (eventData.type === 'end') {
+                  return;
+                }
+              } catch (error) {
+                console.error('解析SSE数据失败:', error, line);
+              }
+            }
+          }
+
+          return readStream();
+        });
+      }
+
+      return readStream();
+    })
+    .catch(error => {
+      console.error('流式AI生成schema失败:', error);
+      reject(error);
+    });
+  });
+}
+
+/**
+ * 流式智能物料选择和schema生成API (Server-Sent Events)
+ * @param data 请求数据
+ * @param onProgress 进度回调函数
+ * @returns Promise<GenerateSchemaResponse>
+ */
+export async function generateSchemaWithMaterialsStream(
+  data: GenerateSchemaRequest,
+  onProgress: (event: StreamEvent) => void
+): Promise<GenerateSchemaResponse> {
+  return new Promise((resolve, reject) => {
+    fetch('http://localhost:3001/api/ai/generate-schema-with-materials-stream', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'text/event-stream',
+      },
+      body: JSON.stringify(data),
+    })
+    .then(response => {
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader || !response.body) {
+        throw new Error('Response body is not readable');
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      function readStream(): Promise<void> {
+        return reader.read().then(({ done, value }) => {
+          if (done) {
+            return;
+          }
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const eventData = JSON.parse(line.slice(6));
+                onProgress(eventData);
+
+                if (eventData.type === 'complete') {
+                  resolve({
+                    success: eventData.success,
+                    message: eventData.message,
+                    result: eventData.result,
+                  });
+                  return;
+                } else if (eventData.type === 'error') {
+                  reject(new Error(eventData.message || eventData.error));
+                  return;
+                } else if (eventData.type === 'end') {
+                  return;
+                }
+              } catch (error) {
+                console.error('解析SSE数据失败:', error, line);
+              }
+            }
+          }
+
+          return readStream();
+        });
+      }
+
+      return readStream();
+    })
+    .catch(error => {
+      console.error('流式智能物料选择生成schema失败:', error);
+      reject(error);
+    });
+  });
+}
+
 /**
  * 调用AI生成schema的API
  * @param data 请求数据
@@ -362,4 +544,65 @@ export async function mockGenerateSchema(prompt: string): Promise<GenerateSchema
     message: `已根据您的需求"${prompt}"生成页面`,
     schema,
   };
+}
+
+/**
+ * 测试流式生成schema
+ */
+export async function generateTestStream(onProgress?: (data: any) => void): Promise<any> {
+  try {
+    const response = await fetch(`${process.env.NODE_ENV === 'development' ? 'http://localhost:3001' : ''}/api/ai/test-stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'text/event-stream',
+      },
+      body: JSON.stringify({}),
+    });
+  
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+  
+    const reader = response.body?.getReader();
+    const decoder = new TextDecoder();
+  
+    if (!reader) {
+      throw new Error('无法获取响应流');
+    }
+  
+    let result = null;
+  
+    while (true) {
+      const { done, value } = await reader.read();
+      
+      if (done) break;
+  
+      const chunk = decoder.decode(value, { stream: true });
+      const lines = chunk.split('\n');
+  
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          try {
+            const eventData = JSON.parse(line.slice(6));
+            
+            if (eventData.type === 'complete') {
+              result = eventData.schema;
+            }
+            
+            if (onProgress) {
+              onProgress(eventData);
+            }
+          } catch (e) {
+            console.warn('解析SSE数据失败:', e);
+          }
+        }
+      }
+    }
+
+    return result;
+  } catch (error) {
+    console.error('测试流式生成失败:', error);
+    throw error;
+  }
 }

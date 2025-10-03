@@ -108,6 +108,17 @@
       border-left: 3px solid #1890ff;
     }
   }
+  
+  &.streaming {
+    justify-content: flex-start;
+    
+    .ai-chat-message-content {
+      background: #f6ffed;
+      color: #52c41a;
+      max-width: 80%;
+      border-left: 3px solid #52c41a;
+    }
+  }
 }
 
 .ai-chat-message-content {
@@ -120,6 +131,17 @@
   word-wrap: break-word;
   white-space: pre-wrap;
   line-height: 1.5;
+  
+  .streaming-indicator {
+    animation: blink 1s infinite;
+    font-weight: bold;
+    color: #52c41a;
+  }
+}
+
+@keyframes blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
 }
 
 .ai-chat-message-time {
